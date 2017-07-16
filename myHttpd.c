@@ -15,7 +15,7 @@
 #define ISspace(x) isspace((int)(x))
 #define SERVER_STRING "server: jdbhttpd/0.1.0\r\n"
 
-void accept_request(int);
+void *accept_request(void *);
 void bad_request(int);
 void cat(int, FILE *);
 void cannot_execute(int);
@@ -33,8 +33,9 @@ void unimplemented(int);
  *  return.  Process the request appropriately.
  * Parameters: the socket connected to the client  */
 /**********************************************************************/
-void accept_request(int client)
+void *accept_request(void *client)
 {
+    int theclient = *(int *)client;
     char buf[1024];
     int numchars;
     char method[255];
@@ -45,11 +46,11 @@ void accept_request(int client)
     int cgi = 0;
 
     char *query_string = NULL;
-    numchars = get_line(client, buf, sizeof(buf));
+    numchars = get_line(theclient, buf, sizeof(buf));
 
     i = 0, j = 0;
 
-    while (!ISspace(buf[i]) && (i < sizeof(method)-1))
+    while (!ISspace(buf[j]) && (i < sizeof(method)-1))
     {
         method[i] = buf[j];
         i++;
@@ -59,7 +60,8 @@ void accept_request(int client)
 
     if (strcasecmp(method, "GET") && strcasecmp(method, "POST"))
     {
-        unimplemented(client);
+        unimplemented(theclient);
+        return NULL;
     }
     //if the method is POST, need cgi
     if (strcasecmp(method, "POST") == 0)
@@ -67,7 +69,7 @@ void accept_request(int client)
 
     //continue to read request_URL
     i = 0;
-    while (!ISspace(buf[j]) && (j < sizeof(buf)))
+    while (ISspace(buf[j]) && (j < sizeof(buf)))
         j++;
     while (!ISspace(buf[j]) && (i < sizeof(url)-1) && (j < sizeof(buf)))
     {
@@ -99,8 +101,8 @@ void accept_request(int client)
     if (stat(path, &st) == -1)
     {   // if the visiting page is unavailable, keep reading and discard headers
         while ((numchars > 0) && strcmp("\n", buf))
-            numchars = get_line(client, buf, sizeof(buf));
-        not_found(client);
+            numchars = get_line(theclient, buf, sizeof(buf));
+        not_found(theclient);
     }
     else
     {
@@ -112,11 +114,12 @@ void accept_request(int client)
            cgi = 1;
 
        if (!cgi)
-           serve_file(client, path);
+           serve_file(theclient, path);
        else
-           execute_cgi(client, path, method, query_string);
+           execute_cgi(theclient, path, method, query_string);
     }
-    close(client);
+    close(theclient);
+    return NULL;
 }
 
 /**********************************************************************/
@@ -418,7 +421,7 @@ int startup(u_short *port)
 {
     int httpd = 0;
     struct sockaddr_in name;
-    httpd = socket(AF_INET, SOCK_STREAM, 0);
+    httpd = socket(PF_INET, SOCK_STREAM, 0);
     if (httpd == -1)
         error_die("socket");
     memset(&name, 0, sizeof(name));
@@ -471,7 +474,7 @@ int main(void)
     u_short port = 0;
     int client_sock = -1;
     struct sockaddr_in client_name;
-    int client_name_len = sizeof(client_name);
+    socklen_t client_name_len = sizeof(client_name);
     pthread_t newthread;
     server_sock = startup(&port);
     printf("httpd running on port %d\n", port);
@@ -487,5 +490,4 @@ int main(void)
     }
     close(server_sock);
     return(0);
-
 }
