@@ -87,13 +87,200 @@ string time_gmt()
     return str_time;
 }
 
-string make_real_url(const string& url)
+string make_real_url(const string& url) //这个函数不理解
 {
     string real_url, url2;
-    int n = 0;
 
-    if((n = url.find()))
+    if( url.find(domain, 0) != string::npos)
+        url2 = url.substr(domain.size(), url.size()-domain.size());
+    else
+        url2 = url;
+
+    if (docroot[docroot.size()-1] == '/')
+    {
+        if (url2[0] == '/')
+            real_url = docroot + url2.erase(0,1);
+        else
+            real_url = docroot + url2;
+    }
+    else
+    {
+        if (url2[0] == '/')
+            real_url = docroot + url2;
+        else
+            real_url = docroot + '/' + url2;
+    }
+
+    return real_url;
 }
+
+int get_file_length(const char *path)
+{
+    struct stat buf;
+    int ret;
+    if ((ret = stat(path, &buf)) == -1)
+    {
+        perror("get_file_length");
+        exit(-1);
+    }
+    return (int)buf.st_size;
+}
+
+string get_file_modified_time(const char *path)
+{
+    struct stat buf;
+    int ret;
+    if ((ret = stat(path, &buf)) == -1)
+    {
+        perror("get_file_modified_time)");
+        exit(-1);
+    }
+    char arr[32] = {0};
+    snprintf(arr, sizeof(arr), "%s", ctime(&buf.st_mtime));
+    return string(arr, arr+strlen(arr));
+}
+
+
+int parse_config(const char *path)
+{
+    config_keyword_map.insert(make_pair("docroot", DOCROOT));
+    config_keyword_map.insert(make_pair("domain", DOMAIN));
+
+    int ret = 0;
+    fstream infile(path, fstream::in);
+    string line, word;
+    if (!infile)
+    {
+        printf("%s can't open\n", path);
+        infile.close();
+        return -1;
+    }
+    while (getline(infile, line))
+    {
+        stringstream stream(line);
+        stream >> word;
+        map<string, int>::const_iterator itr = config_keyword_map.find(word);
+        if (itr == config_keyword_map.end())
+        {
+            printf("can't find keyword\n");
+            infile.close();
+            return -1;
+        }
+        switch (itr ->second)
+        {
+            case DOCROOT:
+                stream >> docroot;
+                break;
+            case DOMAIN:
+                stream >> domain;
+                break;
+            default:
+                infile.close();
+                return -1;
+        }
+    }
+    infile.close();
+    return 0;
+}
+
+void set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+    {
+        perror("fcntl: F_GETFL");
+        exit(-1);
+    }
+    flags |= O_NONBLOCK;
+
+    int ret = fcntl(fd, F_SETFL, flags);
+    if (ret < 0)
+    {
+        perror("fcntl");
+        exit(-1);
+    }
+}
+
+void set_reuse_addr(int sockfd)
+{
+    int on = 1;
+    int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    if (ret == -1)
+    {
+        perror("setsockopt: SO_REUSEADDR");
+        exit(-1);
+    }
+}
+
+void set_off_tcp_nagle(int sockfd)
+{
+    int on = 1;
+    int ret = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+    if (ret == -1)
+    {
+        perror("setsockopt: TCP_NODELAY ON");
+        exit(-1);
+    }
+}
+
+void set_on_tcp_nagle(int sockfd)
+{
+    int off = 0;
+    int ret = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &off, sizeof(off));
+    if (ret == -1)
+    {
+        perror("setsockopt: TCP_NODELAY OFF");
+        exit(-1);
+    }
+}
+
+void set_on_tcp_cork(int sockfd)
+{
+    int on = 1;
+    int ret = setsockopt(sockfd, SOL_TCP, TCP_CORK, &on, sizeof(on));
+    if (ret == -1)
+    {
+        perror("setsockopt: TCP_CORK ON");
+        exit(-1);
+    }
+}
+
+void set_off_tcp_cork(int sockfd)
+{
+    int off = 1;
+    int ret = setsockopt(sockfd, SOL_TCP, TCP_CORK, &off, sizeof(off));
+    if (ret == -1)
+    {
+        perror("setsockopt: TCP_CORK OFF");
+        exit(-1);
+    }
+}
+
+void set_recv_timeo(int sockfd, int sec, int usec)
+{
+    struct timeval time = {sec, usec};
+    int ret = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &time, sizeof(time));
+    if (ret == -1)
+    {
+        perror("setsockopt: SO_RCVTIMEO");
+        exit(-1);
+    }
+}
+
+void set_snd_timeo(int sockfd, int sec, int usec)
+{
+    struct timeval time = {sec, usec};
+    int ret = setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &time, sizeof(time));
+    if (ret == -1)
+    {
+        perror("setsockopt: SO_SNDTIMEO");
+        exit(-1);
+    }
+}
+/***************************** toolkit function ****************************/
+
+
+/***************************** wrapper function ****************************/
 
 int Socket(int domain, int type, int protocol)
 {
@@ -106,7 +293,7 @@ int Socket(int domain, int type, int protocol)
     return listenfd;
 }
 
-int Listen(int sockfd, int backlog)
+void Listen(int sockfd, int backlog)
 {
     if(listen(sockfd, backlog) == -1)
     {
@@ -115,7 +302,7 @@ int Listen(int sockfd, int backlog)
     }
 }
 
-int Bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+void Bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
     if (bind(sockfd, addr, addrlen) == -1)
     {
@@ -223,3 +410,4 @@ void Free(void *ptr)
     free(ptr);
 }
 
+/***************************** wrapper function ****************************/
