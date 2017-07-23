@@ -23,6 +23,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
+#include <unordered_map>
 
 #include "toolkit.h"
 #include "parse.h"
@@ -111,13 +112,17 @@ inline const char* mime_type2value(const char *type)
 #define BADGATEWAY        502       //作为代理或网关使用的服务器遇到了来自响应链中上游的无效响应
 #define SRVUNAVILABLE     503       //服务器目前无法提供请求服务，过一段时间后可以恢复
 
+
+
 char ok[] = "OK";
 char badrequest[]  = "Bad Request";
 char forbidden[] = "Forbidden";
 char notfound[] = "Not Found";
 char noimplemented[] = "No implemented";
 
-char *get_state_by_codes(int http_codes);
+inline char *get_state_by_codes(int http_codes);
+
+
 
 /******************************** HTTP status code ******************************/
 
