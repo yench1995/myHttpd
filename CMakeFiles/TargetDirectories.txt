@@ -1,0 +1,3 @@
+/home/yench/Github/myHttpd/CMakeFiles/edit_cache.dir
+/home/yench/Github/myHttpd/CMakeFiles/rebuild_cache.dir
+/home/yench/Github/myHttpd/CMakeFiles/server.dir

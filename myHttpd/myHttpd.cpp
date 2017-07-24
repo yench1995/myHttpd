@@ -52,7 +52,7 @@ int readn(int connfd, char *buff, size_t count)
 {
     int nread = 0;
     int n;
-    while ((n = read(connfd, buff, ONEMEGA-1)))
+    while ((n = read(connfd, buff, ONEMEGA-1)) > 0)
         nread += n;
     if (n == -1 && errno != EAGAIN)
         return -1;
@@ -106,6 +106,8 @@ int do_http_header(http_header_t *phttphdr, string& out)
     {
         if (file_is_existed(real_url.c_str()) == -1)
         {
+            cout << "the file not existed!" << endl;
+            cout << real_url << endl;
             snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
                     NOTFOUND, get_state_by_codes(NOTFOUND));
             out += (status_line + server + date + crlf);
@@ -113,6 +115,7 @@ int do_http_header(http_header_t *phttphdr, string& out)
         }
         else
         {
+            cout << "the file is existed!" << endl;
             snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
                     OK, get_state_by_codes(OK));
             out += status_line;
@@ -121,7 +124,7 @@ int do_http_header(http_header_t *phttphdr, string& out)
             snprintf(status_line, sizeof(status_line), "%d\r\n", len);
             out += content_length + status_line;
             out += server + content_base + date;
-            out += last_modified + get_file_last_modified_time(real_url.c_str()) + crlf + crlf);
+            out += last_modified + get_file_last_modified_time(real_url.c_str()) + crlf + crlf;
         }
     }
     else if (method == "PUT")
@@ -175,8 +178,9 @@ void *thread_func(void *param)
     set_off_tcp_nagle(connfd);
     set_recv_timeo(connfd, 60, 0);
 
+begin:
     int n = readn(connfd, buff, ONEMEGA-1);
-
+    cout << "starting readn" << endl;
     if (n != 0)
     {
         string str_http_request(buff, buff+n);
@@ -211,21 +215,43 @@ void *thread_func(void *param)
         if (http_codes == OK)
         {
             if (phttphdr->method == "GET")
+            {
                 nwrite = writen(connfd, out_buf, strlen(out_buf));
-            string real_url = make_real_url(phttphdr->url);
-            int fd = open(real_url.c_str(), O_RDONLY);
-            int file_size = get_file_length(real_url.c_str());
-            cout << "file size " << file_size << endl;
-            nwrite = 0;
-            cout <<"sendfile : " << real_url << endl;
-        again:
-            if ((sendfile(connfd, fd, (off_t*)&nwrite, file_size)) < 0)
-                perror("sendfile");
-            if (nwrite < file_size)
-                goto again;
-            cout << "sendfile ok: " << nwrite << endl;
+                string real_url = make_real_url(phttphdr->url);
+                int fd = open(real_url.c_str(), O_RDONLY);
+                int file_size = get_file_length(real_url.c_str());
+                cout << "file size " << file_size << endl;
+                nwrite = 0;
+                cout <<"sendfile : " << real_url << endl;
+            again:
+                if ((sendfile(connfd, fd, (off_t*)&nwrite, file_size)) < 0)
+                    perror("sendfile");
+                if (nwrite < file_size)
+                    goto again;
+                cout << "sendfile ok: " << nwrite << endl;
+            }
+        }
+        free(out_buf);
+
+        nfds = Epoll_wait(epollfd, events, 2, TIMEOUT);
+        if (nfds == 0)
+            goto exit;
+        for (int i = 1; i < nfds; ++i)
+        {
+            if(events[i].data.fd == connfd)
+                goto begin;
+            else
+                goto exit;
         }
     }
+
+exit:
+    free_http_header(phttphdr);
+    close(connfd);
+    thread_num_minus1();
+    printf("Thread %u ends now !", (unsigned int)tid);
+
+    return (void *)0;
 }
 
 int main(int argc, char **argv)
@@ -270,7 +296,7 @@ int main(int argc, char **argv)
 
     bzero(&serveraddr, sizeof(serveraddr));
     serveraddr.sin_family = AF_INET;
-    serveraddr.sin_port = (listen_port);
+    serveraddr.sin_port = htons(6666) ;
     serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     Bind(listenfd, (struct sockaddr*)&serveraddr, sizeof(serveraddr));

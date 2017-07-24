@@ -126,7 +126,7 @@ int get_file_length(const char *path)
     return (int)buf.st_size;
 }
 
-string get_file_modified_time(const char *path)
+string get_file_last_modified_time(const char *path)
 {
     struct stat buf;
     int ret;
@@ -146,7 +146,6 @@ int parse_config(const char *path)
     config_keyword_map.insert(make_pair("docroot", DOCROOT));
     config_keyword_map.insert(make_pair("domain", DOMAIN));
 
-    int ret = 0;
     fstream infile(path, fstream::in);
     string line, word;
     if (!infile)

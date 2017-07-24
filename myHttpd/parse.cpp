@@ -126,6 +126,7 @@ string get_value_from_http_header(const string& key, const m_header& header)
     return itr->second;
 }
 
+/*
 int main(int argc, char **argv)
 {
     http_header_t *phttphdr = alloc_http_header();
@@ -134,7 +135,7 @@ Length: 8080\r\n\
 Date: July Sat 2017\r\n\
 \r\n\
 <html>\n\
-\hello, yench\n\
+hello, yench\n\
 </html>";
 
     cout << "http_request size:" << http_request.size() << endl;
@@ -151,5 +152,5 @@ Date: July Sat 2017\r\n\
     free_http_header(phttphdr);
     return 0;
 }
-
+*/
 
