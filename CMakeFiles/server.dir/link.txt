@@ -1,1 +1,0 @@
-g++      CMakeFiles/server.dir/myHttpd/parse.cpp.o CMakeFiles/server.dir/myHttpd/myHttpd.cpp.o CMakeFiles/server.dir/myHttpd/toolkit.cpp.o  -o server -rdynamic -lpthread 
