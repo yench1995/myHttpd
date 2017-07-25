@@ -87,7 +87,7 @@ string time_gmt()
     return str_time;
 }
 
-string make_real_url(const string& url) //这个函数不理解
+string make_real_url(const string& url)
 {
     string real_url, url2;
 
@@ -96,6 +96,8 @@ string make_real_url(const string& url) //这个函数不理解
     else
         url2 = url;
 
+    if (url2[url2.size()-1] == '/')
+        url2 += "index.html";
     if (docroot[docroot.size()-1] == '/')
     {
         if (url2[0] == '/')

@@ -38,7 +38,7 @@ int main(int argc, char **argv)
         return 1;
     }
     servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(6666);
+    servaddr.sin_port = htons(8080);
     if (inet_pton(AF_INET, argv[1], &servaddr.sin_addr) <= 0)
     {
         fprintf(stderr, "inet_pton error for %s\n", argv[1]);
@@ -52,7 +52,7 @@ int main(int argc, char **argv)
     }
 
     printf("Starting send:\n");
-    char buff[] = "GET www.baidu.com/a.html HTTP/1.1\r\nAccept-Language: zh-cn\r\n\r\n";
+    char buff[] = "GET /abc HTTP/1.1\r\nAccept-Language: zh-cn\r\n\r\n";
     write(sockfd, buff, sizeof(buff));
     printf("Finishing send:\n");
     printf("Starting read:\n");

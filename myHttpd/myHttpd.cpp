@@ -84,6 +84,7 @@ int do_http_header(http_header_t *phttphdr, string& out)
     string crlf("\r\n");
     string server("Server: myhttpd\r\n");
     string Public("Public: GET, HEAD\r\n");
+    string content_type("Content-Type: text/html\r\n");
     string content_base = "Content-Base: " + domain + crlf;
     string date = "Date:" + time_gmt() + crlf;
 
@@ -122,6 +123,7 @@ int do_http_header(http_header_t *phttphdr, string& out)
 
             int len = get_file_length(real_url.c_str());
             snprintf(status_line, sizeof(status_line), "%d\r\n", len);
+            out += content_type;
             out += content_length + status_line;
             out += server + content_base + date;
             out += last_modified + get_file_last_modified_time(real_url.c_str()) + crlf + crlf;
@@ -165,7 +167,7 @@ void *thread_func(void *param)
     ev.events = EPOLLIN|EPOLLET;
     ev.data.fd = connfd;
     int epollfd = Epoll_create(2);
-    Epoll_ctl(epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev);
+    Epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev);
     int nfds = 0;
 
     pthread_t tid = pthread_self();
@@ -218,6 +220,7 @@ begin:
             {
                 nwrite = writen(connfd, out_buf, strlen(out_buf));
                 string real_url = make_real_url(phttphdr->url);
+                cout << real_url << endl;
                 int fd = open(real_url.c_str(), O_RDONLY);
                 int file_size = get_file_length(real_url.c_str());
                 cout << "file size " << file_size << endl;
@@ -225,7 +228,10 @@ begin:
                 cout <<"sendfile : " << real_url << endl;
             again:
                 if ((sendfile(connfd, fd, (off_t*)&nwrite, file_size)) < 0)
+                {
                     perror("sendfile");
+                    goto exit;
+                }
                 if (nwrite < file_size)
                     goto again;
                 cout << "sendfile ok: " << nwrite << endl;
@@ -247,9 +253,10 @@ begin:
 
 exit:
     free_http_header(phttphdr);
+    Epoll_ctl(epollfd, EPOLL_CTL_DEL, connfd, &ev);
     close(connfd);
     thread_num_minus1();
-    printf("Thread %u ends now !", (unsigned int)tid);
+    printf("Thread %u ends now !\n", (unsigned int)tid);
 
     return (void *)0;
 }
@@ -296,7 +303,7 @@ int main(int argc, char **argv)
 
     bzero(&serveraddr, sizeof(serveraddr));
     serveraddr.sin_family = AF_INET;
-    serveraddr.sin_port = htons(6666) ;
+    serveraddr.sin_port = htons(8080) ;
     serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     Bind(listenfd, (struct sockaddr*)&serveraddr, sizeof(serveraddr));
@@ -331,13 +338,13 @@ int main(int argc, char **argv)
                 epollfd_connfd.epollfd = epollfd;
                 epollfd_connfd.connfd = events[n].data.fd;
                 ev.data.fd = events[n].data.fd;
-                Epoll_ctl(epollfd, EPOLL_CTL_DEL, connfd, &ev);
+                Epoll_ctl(epollfd, EPOLL_CTL_DEL, ev.data.fd, &ev);
                 pthread_create(&tid, &pthread_attr_detach, &thread_func, (void *)&epollfd_connfd);
             }
         }
     }
     pthread_attr_destroy(&pthread_attr_detach);
     close(listenfd);
-    return 0;
+    pthread_exit(0);
 }
 
