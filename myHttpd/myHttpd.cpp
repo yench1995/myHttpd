@@ -66,7 +66,7 @@ ssize_t writen(int connfd, const char *buff, size_t count)
     while(nwrite > 0)
     {
         n = write(connfd, buff+count-nwrite, nwrite);
-        if (n < nwrite)
+        if (n < 0)
         {
             if (nwrite == -1 && errno != EAGAIN)
                 return -1;
