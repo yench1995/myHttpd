@@ -1,7 +1,7 @@
-all: tinyHttpd 
+all: tinyHttpd
 
-myHttpd: tinyHttpd.c
-			gcc -W -Wall -pthread -o tinyHttpd tinyHttpd.c 
+tinyHttpd: tinyHttpd.c
+	gcc -W -Wall -o tinyHttpd tinyHttpd.c -lpthread
 
 clean:
-		    rm tinyHttpd 
+	rm tinyHttpd.c 
