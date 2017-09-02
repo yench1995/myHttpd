@@ -1,148 +1,138 @@
-#ifndef _MYHTTPD_H_
-#define _MYHTTPD_H_
+#ifndef MYHTTPD_H
+#define MYHTTPD_H
 
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <netdb.h>
-#include <sys/epoll.h>
-#include <strings.h>
-#include <string>
-#include <errno.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/epoll.h>
 #include <fcntl.h>
-#include <utility>
-#include <fstream>
-#include <sstream>
-#include <map>
-#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <pthread.h>
-#include <netinet/tcp.h>
-#include <time.h>
-#include <sys/stat.h>
-#include <sys/sendfile.h>
-#include <unordered_map>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <stdarg.h>
+#include <errno.h>
 
-#include "toolkit.h"
-#include "parse.h"
 
-using namespace std;
-
-typedef struct epollfd_connfd
+class http_conn
 {
-    int epollfd;
-    int connfd;
-} epollfd_connfd;
+public:
+	/*文件名的最大长度*/
+    static const int FILENAME_LEN = 200;
+	/*读缓冲区的大小*/
+    static const int READ_BUFFER_SIZE = 2048;
+	/*写缓冲区的大小*/
+    static const int WRITE_BUFFER_SIZE = 1024;
+	/*HTTP请求方法，但我们进支持GET*/
+    enum METHOD { GET = 0, POST, HEAD, PUT, DELETE, TRACE, OPTIONS, CONNECT, PATCH };
+	/*解析客户请求时，主状态机所处的状态*/
+    enum CHECK_STATE { CHECK_STATE_REQUESTLINE = 0, CHECK_STATE_HEADER, CHECK_STATE_CONTENT };
+	/*服务器处理HTTP请求时的可能结果*/
+    enum HTTP_CODE { NO_REQUEST, GET_REQUEST, BAD_REQUEST, NO_RESOURCE, FORBIDDEN_REQUEST, FILE_REQUEST, INTERNAL_ERROR, CLOSED_CONNECTION };
+	/*行的读取状态*/
+	enum LINE_STATUS { LINE_OK = 0, LINE_BAD, LINE_OPEN };
 
-/******************************** constant define ******************************/
+public:
+    http_conn(){}
+    ~http_conn(){}
 
-#define MAX_EVENTS 1024 //the most epoll connected events
-#define MAX_BACKLOG 100 //the most listening queue
+public:
+	/*初始化新接手的连接*/
+    void init( int sockfd, const sockaddr_in& addr );
+	/*关闭连接*/
+    void close_conn( bool real_close = true );
+	/*处理客户请求*/
+    void process();
+	/*非阻塞读操作*/
+    bool read();
+	/*非阻塞写操作*/
+    bool write();
 
-/******************************** constant define ******************************/
+private:
+	/*初始化连接*/
+    void init();
+	/*解析HTTP请求*/
+    HTTP_CODE process_read();
+	/*填充HTPTP应答*/
+    bool process_write( HTTP_CODE ret );
 
-/******************************** configuration file******************************/
+	/*下面这一组函数被process_read调用以分析HTTP请求*/
+    HTTP_CODE parse_request_line( char* text );
+    HTTP_CODE parse_headers( char* text );
+    HTTP_CODE parse_content( char* text );
+    HTTP_CODE do_request();
+    char* get_line() { return m_read_buf + m_start_line; }
+    LINE_STATUS parse_line();
 
-string domain("");
-string docroot("");
+	/*下面这一组函数被process_write调用以填充HTTP应答*/
+    void unmap();
+    bool add_response( const char* format, ... );
+    bool add_content( const char* content );
+    bool add_status_line( int status, const char* title );
+    bool add_headers( int content_length );
+    bool add_content_length( int content_length );
+    bool add_date(const char* time);
+    bool add_lastmodified(const char* last_mod_time);
+    bool add_linger();
+    bool add_blank_line();
 
-/******************************** configuration file******************************/
+public:
+	/*所有socket上的事件都被注册到同一个epoll内核事件上，所有将epoll文件描述符设置为静态的*/
+    static int m_epollfd;
+	/*统计用户数量*/
+    static int m_user_count;
 
-/******************************** defination of MIME******************************/
+private:
+	/*读HTTP连接的socket和对方的socket地址*/
+    int m_sockfd;
+    sockaddr_in m_address;
 
-typedef struct mime_node
-{
-    const char *type;
-    const char *value;
-} mime_node;
+	/*读缓冲区*/
+    char m_read_buf[ READ_BUFFER_SIZE ];
+	/*标识读缓冲区中已经读入的客户数据的最后一个字节的下一个位置*/
+    int m_read_idx;
+	/*当前正在分析的字符在读缓冲区中的位置*/
+    int m_checked_idx;
+	/*当前正在解析的行的起始位置*/
+    int m_start_line;
+	/*写缓冲区*/
+    char m_write_buf[ WRITE_BUFFER_SIZE ];
+	/*写缓冲区中待发送的字节数*/
+    int m_write_idx;
 
-mime_node mime[] = {
-    {".html", "text/html"},
-    {".xml", "text/xml"},
-    {".xhtml", "application/xhtml+xml"},
-    {".txt", "text/plain"},
-    {".rtf", "application/rtf"},
-    {".pdf", "application/pdf"},
-    {".word", "application/msword"},
-    {".png", "image/png"},
-    {".gif", "image/gif"},
-    {".jpg", "image/jpeg"},
-    {".jpeg", "image/jpeg"},
-    {".au", "audio/basic"},
-    {".mpeg", "video/mpeg"},
-    {".mpg", "video/mpeg"},
-    {".avi", "video/x-msvideo"},
-    {".gz", "application/x-gzip"},
-    {".tar", "application/x-tar"},
-    {NULL ,NULL}
+
+	/*主状态机当前所处的状态*/
+    CHECK_STATE m_check_state;
+	/*请求方法*/
+    METHOD m_method;
+
+	/*客户请求的目标文件的完整路径，其内容等于doc_toot+m_url,doc_root是网站跟目录*/
+    char m_real_file[ FILENAME_LEN ];
+	/*客户请求的目标文件名*/
+    char* m_url;
+	/*HTTP协议版本号，我们进支持HTTP/1.1*/
+    char* m_version;
+	/*主机名*/
+    char* m_host;
+	/*HTTP请求的消息体的长度*/
+    int m_content_length;
+	/*HTTP请求是否要求保持连接*/
+    bool m_linger;
+
+
+	/*客户请求的目标文件被mmap到内存中的起始位置*/
+    char* m_file_address;
+	/*目标文件的状态。通过它我们可以判断文件是否存在、是否为目录、是否可读，并获取文件大小等信息*/
+    struct stat m_file_stat;
+	/*我们将采取writev来执行写操作，所以定义下面两个成员，其中m_iv_count表示被写内存块的数量*/
+    struct iovec m_iv[2];
+    int m_iv_count;
 };
-
-inline const char* mime_type2value(const char *type)
-{
-    for (int i = 0; mime[i].type != NULL; ++i)
-    {
-        if (strcmp(type, mime[i].type) == 0)
-            return mime[i].value;
-    }
-    return NULL;
-}
-
-/******************************** defination of MIME ******************************/
-
-
-/******************************** HTTP status code ******************************/
-#define CONTINUE          100       //收到了请求的起始部分，客户端应继续请求
-
-#define OK                200       //服务器已经成功处理请求
-#define ACCEPTED          202       //请求已接受，服务器尚未处理
-
-#define MOVED             301       //请求的URL已移走，响应应该包含Location URL
-#define FOUND             302       //请求的URL临时移走，响应应该包含Location URL
-#define SEEOTHER          303       //告诉客户端应该用另一个URL获取资源，响应应该包含Location
-#define NOTMODIFIED       304       //资源未发生变化
-
-#define BADREQUEST        400       //客户端发送了一条异常请求
-#define FORBIDDEN         403       //服务器拒绝请求
-#define NOTFOUND          404       //URL未找到
-
-#define ERROR             500       //服务器出错
-#define NOIMPLEMENTED     501       //服务器不支持当前请求所需要的某个功能
-#define BADGATEWAY        502       //作为代理或网关使用的服务器遇到了来自响应链中上游的无效响应
-#define SRVUNAVILABLE     503       //服务器目前无法提供请求服务，过一段时间后可以恢复
-
-
-
-char ok[] = "OK";
-char badrequest[]  = "Bad Request";
-char forbidden[] = "Forbidden";
-char notfound[] = "Not Found";
-char noimplemented[] = "No implemented";
-
-inline char *get_state_by_codes(int http_codes);
-
-
-
-/******************************** HTTP status code ******************************/
-
-/******************************** HTTP request header *****************************/
-#define ACCEPTRANGE_HEAD      "Accept-Range"
-#define AGC_HEAD              "Age"
-#define ALLOW_HEAD            "Allow"
-#define CONTENTBASE_HEAD      "Content-Base"
-#define CONTENTLENGTH_HEAD    "Content-Length"
-#define CONTENTLOCATION_HEAD  "Content-Location"
-#define CONTENTRANGE_HEAD     "Content-Range"
-#define CONTENTTYPE_HEAD      "Content-Type"
-#define DATE_HEAD             "Date"
-#define EXPIRES_HEAD          "Expires"
-#define LAST_MODIFIED_HEAD    "last-Modified"
-#define LOCATION_HEAD         "Location"
-#define PUBLIC_HEAD           "Public"
-#define RANGE_HEAD            "Range"
-#define SERVER_HEAD           "Server"
-
-/******************************** HTTP request header *****************************/
 
 #endif

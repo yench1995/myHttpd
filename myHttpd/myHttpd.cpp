@@ -1,350 +1,497 @@
 #include "myHttpd.h"
 
-#define ONEKILO    1024
-#define ONEMEGA    1024 * ONEKILO
-#define ONEGIGA    1024 * ONEMEGA
+/*定义HTTP的状态信息*/
+const char *ok_200_title = "OK";
+const char* error_400_title = "Bad Request";
+const char* error_400_form = "Your request has bad syntax or is inherently impossible to satisfy.\n";
+const char* error_403_title = "Forbidden";
+const char* error_403_form = "You do not have permission to get file from this server.\n";
+const char* error_404_title = "Not Found";
+const char* error_404_form = "The requested file was not found on this server.\n";
+const char* error_500_title = "Internal Error";
+const char* error_500_form = "There was an unusual problem serving the requested file.\n";
 
-#define TIMEOUT    1000*60*4 //millseconds
-
-void *thread_func(void *param);
-int thread_num = 0;
-pthread_mutex_t thread_num_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-void thread_num_add1()
-{
-    pthread_mutex_lock(&thread_num_mutex);
-    ++thread_num;
-    pthread_mutex_unlock(&thread_num_mutex);
+int set_nonblocking(int fd) {
+    int old_option = fcntl(fd, F_GETFL);
+    int new_option = old_option | O_NONBLOCK;
+    fcntl(fd, F_SETFL, new_option);
+    return old_option;
 }
 
-void thread_num_minus1()
-{
-    pthread_mutex_lock(&thread_num_mutex);
-    --thread_num;
-    pthread_mutex_unlock(&thread_num_mutex);
+void addfd(int epollfd, int fd, bool one_shot) {
+    epoll_event event;
+    event.data.fd = fd;
+    event.events = EPOLLIN | EPOLLET | EPOLLRDHUP; //EPOLLHUP代表本端挂断
+    //EPOLLONESHOT指只能触发某fd上注册的一个可读写事件
+    //即只能有一个线程或进程处理同一个描述符
+    if (one_shot)
+        event.events |= EPOLLONESHOT;
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
+    set_nonblocking(fd);
 }
 
-char *get_state_by_codes(int http_codes)
-{
-    switch (http_codes)
-    {
-        case OK:
-            return ok;
-            break;
-        case BADREQUEST:
-            return badrequest;
-            break;
-        case FORBIDDEN:
-            return forbidden;
-            break;
-        case NOTFOUND:
-            return notfound;
-            break;
-        case NOIMPLEMENTED:
-            return noimplemented;
-            break;
+void removefd(int epollfd, int fd) {
+    epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, 0);
+    close(fd);
+}
+
+void modfd(int epollfd, int fd, int ev) {
+    epoll_event event;
+    event.data.fd = fd;
+    //EPOLLRDHUP指对端关闭连接或shutdown关闭半连接
+    event.events = ev | EPOLLET | EPOLLONESHOT | EPOLLRDHUP;
+    epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
+}
+
+void http_conn::close_conn(bool real_close) {
+    if (real_close && (m_sockfd != -1)) {
+        removefd(m_epollfd, m_sockfd);
+        m_sockfd = -1;
+        m_user_count--;
+    }
+}
+
+void http_conn::init(int sockfd, const sockaddr_in &addr) {
+    m_sockfd = sockfd;
+    m_address = addr;
+
+    int error = 0;
+    //非阻塞connect建立连接时会直接返回EINPROGRESS
+    //所以需要检查SO_ERROR值是否返回0来看是否建立成功
+    socklen_t len = sizeof(error);
+    getsockopt(m_sockfd, SOL_SOCKET, SO_ERROR, &error, &len);
+
+    addfd(m_epollfd, sockfd, true);
+    m_user_count++;
+
+    init();
+}
+
+void http_conn::init() {
+    m_check_state = CHECK_STATE_REQUESTLINE;
+    m_linger = false;
+
+    m_method = GET;
+    m_url = 0;
+    m_version = 0;
+    m_content_length = 0;
+    m_host = 0;
+    m_start_line = 0;
+    m_checked_idx = 0;
+    m_read_idx = 0;
+    m_read_idx = 0;
+    m_write_idx = 0;
+    memset(m_read_buf, '\0', READ_BUFFER_SIZE);
+    memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
+    memset(m_real_file, '\0', FILENAME_LEN);
+}
+
+/*读取一行的内容，返回状态机信息*/
+http_conn::LINE_STATUS http_conn::parse_line() {
+    char temp;
+    for (; m_checked_idx < m_read_idx; ++m_checked_idx) {
+        temp = m_read_buf[m_checked_idx];
+        if (temp == '\r') {
+            //如果下一个字符是'\n',则读取一个完整的行
+            //否则返回LINE_OPEN，等待下一次读取
+            if ((m_checked_idx + 1) == m_read_idx)
+                return LINE_OPEN;
+            else if (m_read_buf[m_checked_idx+1] == '\n') {
+                //把\r\n变为\0\0
+                m_read_buf[m_checked_idx++] = '\0';
+                m_read_buf[m_checked_idx++] = '\0';
+                return LINE_OK;
+            }
+
+            //语法有错
+            return LINE_BAD;
+        }
+
+        //接着上一次的'\r'继续分析
+        else if (temp == '\n') {
+            if ((m_checked_idx > 1) && (m_read_buf[m_checked_idx -1] == '\r')) {
+                m_read_buf[m_checked_idx-1] = '\0';
+                m_read_buf[m_checked_idx++] = '\0';
+                return LINE_OK;
+            }
+            return LINE_BAD;
+        }
     }
 
-    return NULL;
+    return LINE_OPEN;
 }
 
-int readn(int connfd, char *buff, size_t count)
-{
+/*循环读取客户数据，直到无数据可读或者对方关闭连接*/
+bool http_conn::read() {
+    if (m_read_idx >= READ_BUFFER_SIZE)
+        return false;
+
     int nread = 0;
-    int n;
-    while ((n = read(connfd, buff, ONEMEGA-1)) > 0)
-        nread += n;
-    if (n == -1 && errno != EAGAIN)
-        return -1;
-    return nread;
-}
-
-ssize_t writen(int connfd, const char *buff, size_t count)
-{
-    int nwrite = count;
-    int n;
-    while(nwrite > 0)
-    {
-        n = write(connfd, buff+count-nwrite, nwrite);
-        if (n < 0)
-        {
-            if (nwrite == -1 && errno != EAGAIN)
-                return -1;
-            else
+    while (1) {
+        nread = recv(m_sockfd, m_read_buf+m_read_idx, READ_BUFFER_SIZE-m_read_idx, 0);
+        if (nread == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
+            return false;
+        } else if (nread == 0) {
+            //返回0表示连接关闭
+            return false;
         }
-        nwrite -= n;
+
+        m_read_idx += nread;
     }
-    return count-nwrite;
+    return true;
 }
 
-int do_http_header(http_header_t *phttphdr, string& out)
-{
-    char status_line[256] = {0};
-    string crlf("\r\n");
-    string server("Server: myhttpd\r\n");
-    string Public("Public: GET, HEAD\r\n");
-    string content_type("Content-Type: text/html\r\n");
-    string content_base = "Content-Base: " + domain + crlf;
-    string date = "Date:" + time_gmt() + crlf;
+/*解析HTTP请求行，获得请求方法、URL、以及HTTP版本号*/
+http_conn::HTTP_CODE http_conn::parse_request_line(char *text) {
+    //strpbrk函数返回两个字符串中首个相同字符的位置
+    //检索空白字符和'\t'
+    m_url = strpbrk(text, " \t");
+    if (!m_url)
+        return BAD_REQUEST;
+    *m_url++ = '\0';
 
-    string content_length("Content-Length: ");
-    string conteng_location("Content-Location: ");
-    string last_modified("Last-Modified: ");
+    char *method = text;
 
-    if (phttphdr == NULL)
-    {
-        snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
-                BADREQUEST, get_state_by_codes(BADREQUEST));
-        out = status_line + crlf;
-        return BADREQUEST;
-    }
-
-    string method = phttphdr->method;
-    string real_url = make_real_url(phttphdr->url);
-    string version = phttphdr->version;
-    if (method == "GET" || method == "HEAD")
-    {
-        if (file_is_existed(real_url.c_str()) == -1)
-        {
-            cout << "the file not existed!" << endl;
-            cout << real_url << endl;
-            snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
-                    NOTFOUND, get_state_by_codes(NOTFOUND));
-            out += (status_line + server + date + crlf);
-            return NOTFOUND;
-        }
-        else
-        {
-            cout << "the file is existed!" << endl;
-            snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
-                    OK, get_state_by_codes(OK));
-            out += status_line;
-
-            int len = get_file_length(real_url.c_str());
-            snprintf(status_line, sizeof(status_line), "%d\r\n", len);
-            out += content_type;
-            out += content_length + status_line;
-            out += server + content_base + date;
-            out += last_modified + get_file_last_modified_time(real_url.c_str()) + crlf + crlf;
-        }
-    }
-    else if (method == "PUT")
-    {
-        snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
-                NOIMPLEMENTED, get_state_by_codes(NOIMPLEMENTED));
-        out += status_line + server + Public + date + crlf;
-        return NOIMPLEMENTED;
-    }
-    else if (method == "POST")
-    {
-        snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
-                NOIMPLEMENTED, get_state_by_codes(NOIMPLEMENTED));
-        out += status_line + server + Public + date + crlf;
-        return NOIMPLEMENTED;
-    }
+    //当前仅支持GET操作
+    if (strcasecmp(method, "GET") == 0)
+        m_method = GET;
     else
-    {
-        snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
-                BADREQUEST, get_state_by_codes(BADREQUEST));
-        out = status_line + crlf;
-        return BADREQUEST;
+        return BAD_REQUEST;
+
+    //strspn用来计算前者字符串中有连续几个字符属于后者字符串
+    //跳过多于空白字符
+    m_url += strspn(m_url, " \t");
+    m_version = strpbrk(m_url, " \t");
+    if (!m_version)
+        return BAD_REQUEST;
+
+    *m_version++ = '\0';
+    m_version += strspn(m_version, " \t");
+    if (strcasecmp(m_version, "HTTP/1.1") != 0)
+        return BAD_REQUEST;
+
+    if (strncasecmp(m_url, "http://", 7) == 0) {
+        m_url += 7;
+        m_url = strchr(m_url, '\n');
     }
 
-    return OK;
+    m_check_state = CHECK_STATE_HEADER;
+    return NO_REQUEST;
 }
 
-void *thread_func(void *param)
-{
-    thread_num_add1();
-    http_header_t *phttphdr = alloc_http_header();
+/*解析HTTP请求的头部信息*/
+http_conn::HTTP_CODE http_conn::parse_headers(char *text) {
+    //遇到空行，表示头部解析完毕
+    if (text[0] == '\0') {
+        //HEAD方法，仅向服务器请求某个资源的响应头
+        if (m_method == HEAD)
+            return GET_REQUEST;
 
-    epollfd_connfd *ptr_epollfd_connfd = (epollfd_connfd*)param;
-    int connfd = ptr_epollfd_connfd->connfd;
-
-    //create new epoll for the connection in the thread
-    struct epoll_event ev, events[2];
-    ev.events = EPOLLIN|EPOLLET;
-    ev.data.fd = connfd;
-    int epollfd = Epoll_create(2);
-    Epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev);
-    int nfds = 0;
-
-    pthread_t tid = pthread_self();
-    printf("Thread %u is running now !\n", (unsigned int)tid);
-
-    //assign 1m buff for the http request
-    char *buff = (char*)Malloc(ONEMEGA);
-    bzero(buff, ONEMEGA);
-
-    set_off_tcp_nagle(connfd);
-    set_recv_timeo(connfd, 60, 0);
-
-begin:
-    int n = readn(connfd, buff, ONEMEGA-1);
-    cout << "starting readn" << endl;
-    if (n != 0)
-    {
-        string str_http_request(buff, buff+n);
-        if (!parse_http_request(str_http_request, phttphdr))
-        {
-            perror("parse_http_request: parse str_http_request failed)");
-            goto exit;
+        //如果还有body部分，则还有继续读取
+        if (m_content_length != 0) {
+            m_check_state = CHECK_STATE_CONTENT;
+            return NO_REQUEST;
         }
 
-        cout << "The parsed http request" << endl;
-        print_http_header(phttphdr);
+        return GET_REQUEST;
 
-        string out;
-        int http_codes = do_http_header(phttphdr, out);
+    //解析Connection
+    } else if (strncasecmp(text, "Connection:", 11) == 0) {
+        text += 11;
+        text += strspn(text, " \t");
+        //长连接
+        if (strcasecmp (text, "keep-alive") == 0)
+            m_linger = true;
 
-        cout <<"the back http request:" << endl << out << endl;
+    //解析Content-Length
+    } else if (strncasecmp(text, "Content-Length:", 15) == 0) {
+        text += 15;
+        text += strspn(text, " \t");
+        m_content_length = atol(text);
 
-        char *out_buf = (char *)Malloc(out.size());
-        if (out_buf == NULL)
-            goto exit;
-        size_t i;
-        for (i=0; i != out.size(); ++i)
-            out_buf[i] = out[i];
-        out_buf[i] = '\0';
-        ssize_t nwrite;
-        if (http_codes == BADREQUEST||
-                http_codes == NOIMPLEMENTED||
-                http_codes == NOTFOUND||
-                (http_codes == OK && phttphdr->method == "HEAD"))
-            nwrite = writen(connfd, out_buf, strlen(out_buf));
-
-        if (http_codes == OK)
-        {
-            if (phttphdr->method == "GET")
-            {
-                nwrite = writen(connfd, out_buf, strlen(out_buf));
-                string real_url = make_real_url(phttphdr->url);
-                cout << real_url << endl;
-                int fd = open(real_url.c_str(), O_RDONLY);
-                int file_size = get_file_length(real_url.c_str());
-                cout << "file size " << file_size << endl;
-                nwrite = 0;
-                cout <<"sendfile : " << real_url << endl;
-            again:
-                if ((sendfile(connfd, fd, (off_t*)&nwrite, file_size)) < 0)
-                {
-                    perror("sendfile");
-                    goto exit;
-                }
-                if (nwrite < file_size)
-                    goto again;
-                cout << "sendfile ok: " << nwrite << endl;
-            }
-        }
-        free(out_buf);
-
-        nfds = Epoll_wait(epollfd, events, 2, TIMEOUT);
-        if (nfds == 0)
-            goto exit;
-        for (int i = 1; i < nfds; ++i)
-        {
-            if(events[i].data.fd == connfd)
-                goto begin;
-            else
-                goto exit;
-        }
+    //解析Host
+    } else if (strncasecmp(text, "Host:", 5) == 0) {
+        text += 5;
+        text += strspn(text, " \t");
+        m_host = text;
+    } else {
+        printf("Unknown header %s\n", text);
     }
 
-exit:
-    free_http_header(phttphdr);
-    Epoll_ctl(epollfd, EPOLL_CTL_DEL, connfd, &ev);
-    close(connfd);
-    thread_num_minus1();
-    printf("Thread %u ends now !\n", (unsigned int)tid);
-
-    return (void *)0;
+    return NO_REQUEST;
 }
 
-int main(int argc, char **argv)
-{
-    int listenfd, connfd, epollfd;
-    int nfds;
-    int listen_port;
-
-    struct servent *pservent;
-    struct epoll_event ev, events[MAX_EVENTS];
-
-    struct sockaddr_in serveraddr;
-    struct sockaddr_in clientaddr;
-
-    socklen_t addrlen;
-    pthread_attr_t pthread_attr_detach;
-    epollfd_connfd epollfd_connfd;
-    pthread_t tid;
-
-    if(argc != 2)
-    {
-        printf("Usage: %s <config_path>\n", argv[0]);
+/*解析HTTP请求的正文(并没有实现，留坑)*/
+http_conn::HTTP_CODE http_conn::parse_content(char *text) {
+    if (m_read_idx >= (m_content_length + m_checked_idx)) {
+        text[m_content_length] = '\0';
+        return GET_REQUEST;
     }
 
-    if (file_is_existed(argv[1]) == -1)
-    {
-        perror("file_is_existed");
-        exit(-1);
-    }
+    return NO_REQUEST;
+}
 
-    if (parse_config(argv[1]) == -1)
-    {
-        perror("file_is_existed");
-        exit(-1);
-    }
+/*主解析函数*/
+http_conn::HTTP_CODE http_conn::process_read() {
+    LINE_STATUS line_status = LINE_OK;
+    HTTP_CODE ret = NO_REQUEST;
+    char *text = 0;
 
-    listenfd = Socket(AF_INET, SOCK_STREAM, 0);
-    set_nonblocking(listenfd);
-    set_reuse_addr(listenfd);
-    pservent = getservbyname("http", "tcp");
-    listen_port = pservent->s_port;
+    while (((m_check_state == CHECK_STATE_CONTENT) && (line_status == LINE_OK))
+            || ((line_status = parse_line()) == LINE_OK)) {
+        text = get_line();
+        m_start_line = m_checked_idx;
+        printf("get 1 http line: %s\n", text);
 
-    bzero(&serveraddr, sizeof(serveraddr));
-    serveraddr.sin_family = AF_INET;
-    serveraddr.sin_port = htons(8080) ;
-    serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    Bind(listenfd, (struct sockaddr*)&serveraddr, sizeof(serveraddr));
-    Listen(listenfd, MAX_BACKLOG);
-
-    epollfd = Epoll_create(MAX_EVENTS);
-    ev.events = EPOLLIN;
-    ev.data.fd = listenfd;
-    Epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd, &ev);
-
-    pthread_attr_init(&pthread_attr_detach);
-    pthread_attr_setdetachstate(&pthread_attr_detach, PTHREAD_CREATE_DETACHED);
-
-    while (1)
-    {
-        nfds = Epoll_wait(epollfd, events, MAX_EVENTS, -1);
-        if (nfds == -1 && errno == EINTR)
-            continue;
-
-        for (int n = 0; n != nfds; ++n)
-        {
-            if (events[n].data.fd == listenfd)
+        switch (m_check_state) {
+            case CHECK_STATE_REQUESTLINE:    //第一个状态，分析请求
             {
-                connfd = Accept(listenfd, (struct sockaddr*)&clientaddr, &addrlen);
-                set_nonblocking(connfd);
-                ev.events = EPOLLIN | EPOLLET;
-                ev.data.fd = connfd;
-                Epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev);
+                ret = parse_request_line(text);
+                if (ret == BAD_REQUEST)
+                    return BAD_REQUEST;
+                break;
             }
-            else
+
+            case CHECK_STATE_HEADER:         //第二个状态，分析头部
             {
-                epollfd_connfd.epollfd = epollfd;
-                epollfd_connfd.connfd = events[n].data.fd;
-                ev.data.fd = events[n].data.fd;
-                Epoll_ctl(epollfd, EPOLL_CTL_DEL, ev.data.fd, &ev);
-                pthread_create(&tid, &pthread_attr_detach, &thread_func, (void *)&epollfd_connfd);
+                ret = parse_headers(text);
+                if (ret == BAD_REQUEST)
+                    return BAD_REQUEST;
+                else if (ret == GET_REQUEST)
+                    return do_request();
+                break;
+            }
+
+            case CHECK_STATE_CONTENT:        //第三个状态，分析正文
+            {
+                ret = parse_content(text);
+                if (ret == GET_REQUEST)
+                    return do_request();
+                line_status = LINE_OPEN;
+                break;
+            }
+
+            default:
+                return INTERNAL_ERROR;
+        }
+    }
+
+    return NO_REQUEST;
+}
+
+/*
+ * 分析HTTP请求的文件的属性
+ * 如果目标正确，则使用mmap将其映射到内存地址m_file_address处
+ * 并告诉调用者获取文件成功
+ */
+http_conn::HTTP_CODE http_conn::do_request() {
+    //检测文件的状态是否可访问
+    if (stat(m_real_file, &m_file_stat) < 0)
+        return NO_RESOURCE;
+    if (!(m_file_stat.st_mode & S_IROTH))
+        return FORBIDDEN_REQUEST;
+    if (S_ISDIR(m_file_stat.st_mode))
+        return BAD_REQUEST;
+
+    //建立内存映射
+    int fd = open(m_real_file, O_RDONLY);
+    m_file_address = (char *)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    return FILE_REQUEST;
+}
+
+/*对内存映射去执行munmap操作*/
+void http_conn::unmap() {
+    if (m_file_address) {
+        munmap(m_file_address, m_file_stat.st_size);
+        m_file_address = 0;
+    }
+}
+
+/*写HTTP响应*/
+bool http_conn::write() {
+    int temp = 0;
+    int bytes_have_send = 0;
+    int bytes_to_send = m_write_idx;
+    if (bytes_to_send == 0) {
+        modfd(m_epollfd, m_sockfd, EPOLLIN);
+        init();
+        return true;
+    }
+
+    while (1) {
+        //聚集写，由多个缓冲区向sockfd写入
+        temp = writev(m_sockfd, m_iv, m_iv_count);
+        if (temp <= -1) {
+            if (errno == EAGAIN){
+            //缓冲区满，则下次再写
+                modfd(m_epollfd, m_sockfd, EPOLLOUT);
+                return true;
+            }
+
+            unmap();
+            return false;
+        }
+
+        bytes_have_send += temp;
+        if (bytes_to_send <= bytes_have_send) {
+            unmap();
+            //长连接则重置http_conn结构，否则返回false使其关闭
+            if (m_linger) {
+                init();
+                modfd(m_epollfd, m_sockfd, EPOLLIN);
+                return true;
+            } else {
+                return false;
             }
         }
     }
-    pthread_attr_destroy(&pthread_attr_detach);
-    close(listenfd);
-    pthread_exit(0);
 }
+
+/*往写缓冲区写入待发送的头部信息*/
+bool http_conn::add_response(const char *format, ...) {
+    if (m_write_idx >= WRITE_BUFFER_SIZE)
+        return false;
+    va_list arg_list;
+    va_start(arg_list, format);
+    int len = vsnprintf(m_write_buf + m_write_idx, WRITE_BUFFER_SIZE-1-m_write_idx, format, arg_list);
+    if (len >= (WRITE_BUFFER_SIZE-1-m_write_idx))
+        return false;
+
+    m_write_idx += len;
+    va_end(arg_list);
+    return true;
+}
+
+/*添加状态行*/
+bool http_conn::add_status_line(int status, const char *title) {
+    return add_response("%s %d %s\r\n", "HTTP/1.1", status, title);
+}
+
+/*添加头部*/
+bool http_conn::add_headers(int content_len) {
+    return add_content_length(content_len);
+    add_linger();
+    add_blank_line();
+}
+
+/*添加长度信息*/
+bool http_conn::add_content_length(int content_len) {
+    return add_response("Content-Length: %d\r\n", content_len);
+}
+
+/*添加连接信息*/
+bool http_conn::add_linger() {
+    return add_response("Connection: %s\r\n", (m_linger == true) ? "keep-alive" : "close");
+}
+
+/*添加时间*/
+bool http_conn::add_date(const char* time) {
+    return add_response("Date: %s\r\n", time);
+}
+
+/*添加最后修改时间*/
+bool http_conn::add_lastmodified(const char *last_mod_time) {
+    return add_response("Last-Modified: %s\r\n", last_mod_time);
+}
+
+/*添加空白行*/
+bool http_conn::add_blank_line() {
+    return add_response("%s", "\r\n");
+}
+
+/*添加content*/
+bool http_conn::add_content(const char *content) {
+    return add_response("%s", content);
+}
+
+/*根据服务器处理HTTP请求的结果，决定返回给客户端的内容*/
+bool http_conn::process_write(HTTP_CODE ret) {
+    switch (ret) {
+        case INTERNAL_ERROR:
+        {
+            add_status_line(500, error_500_title);
+            add_headers(strlen(error_500_form));
+            if (!add_content(error_500_form))
+                return false;
+            break;
+        }
+
+        case BAD_REQUEST:
+        {
+            add_status_line(400, error_400_title);
+            add_headers(strlen(error_400_form));
+            if (!add_content(error_400_form))
+                return false;
+            break;
+        }
+
+        case NO_RESOURCE:
+        {
+            add_status_line(404, error_404_title);
+            add_headers(strlen(error_404_form));
+            if (!add_content(error_404_form))
+                return false;
+            break;
+        }
+
+        case FORBIDDEN_REQUEST:
+        {
+            add_status_line(403, error_403_title);
+            add_headers(strlen(error_403_form));
+            if (!add_content(error_403_form))
+                return false;
+            break;
+        }
+
+        case FILE_REQUEST:
+        {
+            add_status_line(200, ok_200_title);
+            if (m_file_stat.st_size != 0) {
+                add_headers(m_file_stat.st_size);
+                m_iv[0].iov_base = m_write_buf;
+                m_iv[0].iov_len = m_write_idx;
+                m_iv[1].iov_base = m_file_address;
+                m_iv[1].iov_len = m_file_stat.st_size;
+                m_iv_count = 2;
+                return true;
+            } else {
+                const char *ok_string = "<html><body></body></html>";
+                add_headers(strlen(ok_string));
+                if (!add_content(ok_string))
+                    return false;
+            }
+        }
+
+        default:
+        {
+            return false;
+        }
+    }
+    m_iv[0].iov_base = m_write_buf;
+    m_iv[0].iov_len = m_write_idx;
+    m_iv_count = 1;
+    return true;
+}
+
+/*线程函数的主调用入口，由它来处理HTTP请求的整个流程*/
+void http_conn::process() {
+    HTTP_CODE read_ret = process_read();
+    if (read_ret == NO_REQUEST) {
+        modfd(m_epollfd, m_sockfd, EPOLLIN);
+        return;
+    }
+
+    bool write_ret = process_write(read_ret);
+
+    //非长连接
+    if (!write_ret)
+        close_conn();
+
+    modfd(m_epollfd, m_sockfd, EPOLLOUT);
+
+}
+
 

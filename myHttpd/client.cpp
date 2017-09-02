@@ -52,7 +52,7 @@ int main(int argc, char **argv)
     }
 
     printf("Starting send:\n");
-    char buff[] = "GET /abc HTTP/1.1\r\nAccept-Language: zh-cn\r\n\r\n";
+    char buff[] = "GET / HTTP/1.1\r\nAccept-Language: zh-cn\r\n\r\n";
     write(sockfd, buff, sizeof(buff));
     printf("Finishing send:\n");
     printf("Starting read:\n");

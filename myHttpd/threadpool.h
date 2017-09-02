@@ -4,7 +4,6 @@
 #include <list>
 #include <cstdio>
 #include <pthread.h>
-#include <exceptions.h>
 #include <semaphore.h>
 
 template< typename T >
@@ -48,10 +47,12 @@ threadpool<T>::threadpool(int thread_number, int max_requests):
 
         for (int i = 0; i < thread_number; ++i) {
             printf("create the %dth thread\n", i);
-            pthread(create(threads+i, NULL, worker, this) != 0);
+            pthread_create(threads+i, NULL, worker, this) != 0;
             //把线程设置为脱离线程
             pthread_detach(threads[i]);
         }
+
+        printf("create end\n");
 }
 
 template<typename T>
@@ -84,7 +85,7 @@ template<typename T>
 void threadpool<T>::run() {
     while(!stop) {
         sem_wait(&queuestat);
-        pthread_mutex_lock(queuelocker);
+        pthread_mutex_lock(&queuelocker);
         if (workqueue.empty()) {
             pthread_mutex_unlock(&queuelocker);
             continue;
