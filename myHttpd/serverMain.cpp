@@ -21,7 +21,7 @@ const char *config_path = "./myHttpd.config";
 extern int addfd(int epollfd, int fd, bool one_shot);
 extern int removefd(int epollfd, int fd);
 
-int http_conn::m_epollfd = 0;
+int http_conn::m_epollfd = -1;
 int http_conn::m_user_count = 0;
 
 void addsig(int sig, void(handler)(int), bool restart = true) {

@@ -2,6 +2,7 @@
 #define MYHTTPD_H
 
 #include <unistd.h>
+#include <string>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/epoll.h>
@@ -69,6 +70,7 @@ private:
     HTTP_CODE do_request();
     char* get_line() { return m_read_buf + m_start_line; }
     LINE_STATUS parse_line();
+    void make_url(char *);
 
 	/*下面这一组函数被process_write调用以填充HTTP应答*/
     void unmap();
@@ -80,6 +82,7 @@ private:
     bool add_date(const char* time);
     bool add_lastmodified(const char* last_mod_time);
     bool add_linger();
+    bool add_content_type();
     bool add_blank_line();
 
 public:
@@ -112,18 +115,25 @@ private:
 	/*请求方法*/
     METHOD m_method;
 
-	/*客户请求的目标文件的完整路径，其内容等于doc_toot+m_url,doc_root是网站跟目录*/
+	/*客户请求的目标文件的完整路径，其内容等于doc_root+m_url,doc_root是网站根目录*/
     char m_real_file[ FILENAME_LEN ];
 	/*客户请求的目标文件名*/
-    char* m_url;
+    char *m_url;
 	/*HTTP协议版本号，我们进支持HTTP/1.1*/
-    char* m_version;
+    char *m_version;
 	/*主机名*/
-    char* m_host;
+    char *m_host;
 	/*HTTP请求的消息体的长度*/
     int m_content_length;
 	/*HTTP请求是否要求保持连接*/
     bool m_linger;
+    /*支持语言*/
+    char *m_accept_language;
+    /*解码方式*/
+    char *m_accept_encoding;
+    /*接收格式*/
+    char *m_accept;
+
 
 
 	/*客户请求的目标文件被mmap到内存中的起始位置*/

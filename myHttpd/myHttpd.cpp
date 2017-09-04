@@ -11,12 +11,101 @@ const char* error_404_form = "The requested file was not found on this server.\n
 const char* error_500_title = "Internal Error";
 const char* error_500_form = "There was an unusual problem serving the requested file.\n";
 
+/*网页所在文件夹和域名*/
+const char *doc_root = "/home/yench/Github/myHttpd/myHttpd/";
+const char *domain = "www.yench.com";
+
 int set_nonblocking(int fd) {
     int old_option = fcntl(fd, F_GETFL);
     int new_option = old_option | O_NONBLOCK;
     fcntl(fd, F_SETFL, new_option);
     return old_option;
 }
+
+char *get_time()
+{
+    time_t now;
+    struct tm *time_now;
+    std::string str_time;
+
+    time(&now);
+    time_now = localtime(&now);
+
+    switch(time_now->tm_wday)
+    {
+        case 0:
+            str_time += "Sun, ";
+            break;
+        case 1:
+            str_time += "Mon, ";
+            break;
+        case 2:
+            str_time += "Tue, ";
+            break;
+        case 3:
+            str_time += "Wed, ";
+            break;
+        case 4:
+            str_time += "Thu, ";
+            break;
+        case 5:
+            str_time += "Fri, ";
+            break;
+        case 6:
+            str_time += "Sat, ";
+            break;
+    }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d ", time_now->tm_mday);
+    str_time += std::string(buf);
+    switch(time_now->tm_mon)
+    {
+        case 0:
+            str_time += "Jan ";
+            break;
+        case 1:
+            str_time += "Feb ";
+            break;
+        case 2:
+            str_time += "Mar ";
+            break;
+        case 3:
+            str_time += "Apr ";
+            break;
+        case 4:
+            str_time += "May ";
+            break;
+        case 5:
+            str_time += "Jun ";
+            break;
+        case 6:
+            str_time += "Jul ";
+            break;
+        case 7:
+            str_time += "Aug ";
+            break;
+        case 8:
+            str_time += "Sep ";
+            break;
+        case 9:
+            str_time += "Oct ";
+            break;
+        case 10:
+            str_time += "Nov ";
+            break;
+        case 11:
+            str_time += "Dec ";
+            break;
+    }
+    snprintf(buf, sizeof(buf), "%d", time_now->tm_year + 1900);
+    str_time += std::string(buf);
+    snprintf(buf, sizeof(buf), " %d:%d:%d ", time_now->tm_hour, time_now->tm_min, time_now->tm_sec);
+    str_time += std::string(buf);
+
+    str_time += "GMT";
+    return const_cast<char *>(str_time.c_str());
+}
+
 
 void addfd(int epollfd, int fd, bool one_shot) {
     epoll_event event;
@@ -76,11 +165,15 @@ void http_conn::init() {
     m_version = 0;
     m_content_length = 0;
     m_host = 0;
+    m_accept_language = 0;
+    m_accept = 0;
+    m_accept_encoding = 0;
     m_start_line = 0;
     m_checked_idx = 0;
     m_read_idx = 0;
     m_read_idx = 0;
     m_write_idx = 0;
+    memset(m_real_file, '\0', 200);
     memset(m_read_buf, '\0', READ_BUFFER_SIZE);
     memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
     memset(m_real_file, '\0', FILENAME_LEN);
@@ -174,7 +267,6 @@ http_conn::HTTP_CODE http_conn::parse_request_line(char *text) {
 
     if (strncasecmp(m_url, "http://", 7) == 0) {
         m_url += 7;
-        m_url = strchr(m_url, '\n');
     }
 
     m_check_state = CHECK_STATE_HEADER;
@@ -216,10 +308,24 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text) {
         text += 5;
         text += strspn(text, " \t");
         m_host = text;
+    //解析解码方式
+    } else if (strncasecmp(text, "Accept-Encoding:", 16)) {
+        text += 16;
+        text += strspn(text, " \t");
+        m_accept_encoding = text;
+    } else if (strncasecmp(text, "Accept-Language:", 16)) {
+        text += 16;
+        text += strspn(text, " \t");
+        m_accept_language = text;
+    } else if (strncasecmp(text, "Accept:", 7)) {
+        text += 16;
+        text += strspn(text, " \t");
+        m_accept = text;
     } else {
-        printf("Unknown header %s\n", text);
+        printf("Unknown header: %s", text);
     }
 
+    printf("parse end\n");
     return NO_REQUEST;
 }
 
@@ -282,12 +388,34 @@ http_conn::HTTP_CODE http_conn::process_read() {
 }
 
 /*
+ * 解析url
+ * 转化成文件在主机上的地址
+ */
+void http_conn::make_url(char *url) {
+    if (strncasecmp(url, domain, 13) == 0)
+        url += 13;
+    if (url[0] == 0 || (url[0] == '/' && url[1] == '\0')) {
+        strcpy(m_real_file, doc_root);
+        strcat(m_real_file, "index.html");
+    } else if (url[0] == '/') {
+        strcpy(m_real_file, doc_root);
+        strcat(m_real_file, url+1);
+    } else {
+        strcpy(m_real_file, doc_root);
+        strcat(m_real_file, url);
+    }
+}
+
+/*
  * 分析HTTP请求的文件的属性
  * 如果目标正确，则使用mmap将其映射到内存地址m_file_address处
  * 并告诉调用者获取文件成功
  */
 http_conn::HTTP_CODE http_conn::do_request() {
     //检测文件的状态是否可访问
+    printf("the origin url: %s\n", m_url);
+    make_url(m_url);
+    printf("the file address: %s\n", m_real_file);
     if (stat(m_real_file, &m_file_stat) < 0)
         return NO_RESOURCE;
     if (!(m_file_stat.st_mode & S_IROTH))
@@ -372,7 +500,8 @@ bool http_conn::add_status_line(int status, const char *title) {
 
 /*添加头部*/
 bool http_conn::add_headers(int content_len) {
-    return add_content_length(content_len);
+    add_content_type();
+    add_content_length(content_len);
     add_linger();
     add_blank_line();
 }
@@ -387,9 +516,15 @@ bool http_conn::add_linger() {
     return add_response("Connection: %s\r\n", (m_linger == true) ? "keep-alive" : "close");
 }
 
+
 /*添加时间*/
 bool http_conn::add_date(const char* time) {
     return add_response("Date: %s\r\n", time);
+}
+
+/*添加类型格式*/
+bool http_conn::add_content_type() {
+    return add_response("Content-Type: text/html;charset=ISO-8859-1\r\n");
 }
 
 /*添加最后修改时间*/
@@ -478,7 +613,9 @@ bool http_conn::process_write(HTTP_CODE ret) {
 
 /*线程函数的主调用入口，由它来处理HTTP请求的整个流程*/
 void http_conn::process() {
+    printf("starting process\n");
     HTTP_CODE read_ret = process_read();
+    printf("read end\n");
     if (read_ret == NO_REQUEST) {
         modfd(m_epollfd, m_sockfd, EPOLLIN);
         return;

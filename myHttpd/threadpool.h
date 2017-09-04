@@ -69,7 +69,7 @@ bool threadpool<T>::append(T *request) {
         return false;
     }
     workqueue.push_back(request);
-    pthread_mutex_lock(&queuelocker);
+    pthread_mutex_unlock(&queuelocker);
     sem_post(&queuestat);
     return true;
 }
